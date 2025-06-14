@@ -1,5 +1,14 @@
 import postgres from 'postgres';
 import pg, { Client } from "pg";
+import dotenv from 'dotenv';
+import path from 'path';
+
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+
+console.log('Environment variables loaded:', {
+    POSTGRES_URL: process.env.POSTGRES_URL ? 'Set' : 'Not set',
+    RPC_URL: process.env.RPC_URL ? 'Set' : 'Not set'
+});
 
 // GET PROGRAM ID -> GET ALL TXNS FOR THAT PROGRAM ID(USE RPC METHODS TO QUERY) + PARSE EACH TXN 
 // FOR GIVEN (PROGRAM ID, TXN) -> FILTER ALL IXNS IN THAT TXN, (TAKE THE IXN DATA+NAME+FEE_PAYER+..) FOR EACH IXN FROM ITS MESSAGE HEADER
@@ -17,9 +26,9 @@ function getDb(dbUrl: string) {
 }
 
 // //get + parse txns for a given program id
-// async function getTxnsForProgramId(programId: string) {
+async function getTxnsForProgramId(programId: string) {
     
-// }
+}
 
 async function rpcFetch(rpcUrl: string, txnSig: string) {
     try {
@@ -33,8 +42,8 @@ async function rpcFetch(rpcUrl: string, txnSig: string) {
         const body = {
             jsonrpc: "2.0",
             id: 1,
-            method: "getParsedTransaction",
-            params: [txnSig, "confirmed"]
+            method: "getTransaction",
+            params: [txnSig, {"encoding": "json", "maxSupportedTransactionVersion":0, commitment: "finalized"}]
         };
 
         const response = await fetch(rpcUrl, {
@@ -62,46 +71,55 @@ async function rpcFetch(rpcUrl: string, txnSig: string) {
 
 // FOR GIVEN PROGRAM ID + TXN, FILTER and parse and get the (ixn data,name,fee_payer, accounts involved in that)
 async function parseInstructionsForGivenTransaction(rpcUrl: string, txnSig: string) {
-    const parsedTxn = await rpcFetch(rpcUrl, txnSig);
+    try {
+        const parsedTxn = await rpcFetch(rpcUrl, txnSig);
 
-    if (!parsedTxn || typeof parsedTxn !== "object") {
-        throw new Error("rpcFetch did not return a valid transaction object");
-    }
-    if (!parsedTxn.transaction || typeof parsedTxn.transaction !== "object") {
-        throw new Error("Transaction object missing in parsed transaction");
-    }
-    if (!parsedTxn.transaction.message || typeof parsedTxn.transaction.message !== "object") {
-        throw new Error("Transaction message missing in parsed transaction");
-    }
-    if (!Array.isArray(parsedTxn.transaction.message.instructions)) {
-        throw new Error("Instructions array missing in transaction message");
-    }
-    if (!Array.isArray(parsedTxn.transaction.message.accountKeys)) {
-        throw new Error("Account keys array missing in transaction message");
-    }
+        if (!parsedTxn || typeof parsedTxn !== "object") {
+            throw new Error("rpcFetch did not return a valid transaction object");
+        }
+        if (!parsedTxn.transaction || typeof parsedTxn.transaction !== "object") {
+            throw new Error("Transaction object missing in parsed transaction");
+        }
+        if (!parsedTxn.transaction.message || typeof parsedTxn.transaction.message !== "object") {
+            throw new Error("Transaction message missing in parsed transaction");
+        }
+        if (!Array.isArray(parsedTxn.transaction.message.instructions)) {
+            throw new Error("Instructions array missing in transaction message");
+        }
+        if (!Array.isArray(parsedTxn.transaction.message.accountKeys)) {
+            throw new Error("Account keys array missing in transaction message");
+        }
 
-    const message = parsedTxn.transaction.message;
-    const accountKeys: string[] = message.accountKeys;
-    const instructions = message.instructions;
-    const signatures = Array.isArray(parsedTxn.transaction.signatures) ? parsedTxn.transaction.signatures : [];
-    const feePayer = accountKeys[0] || null; 
-    const meta = parsedTxn.meta && typeof parsedTxn.meta === "object" ? parsedTxn.meta : {};
-    const fee = meta.fee || null;
+        const message = parsedTxn?.transaction?.message;
+        const accountKeys: string[] = message.accountKeys;
+        const instructions = message?.instructions || [];
+        const signatures = Array.isArray(parsedTxn.transaction.signatures) ? parsedTxn.transaction.signatures : [];
+        const feePayer = accountKeys[0] || null; 
+        const meta = parsedTxn.meta && typeof parsedTxn.meta === "object" ? parsedTxn.meta : {};
+        const fee = meta.fee || null;
 
+        let ixnArray: DBElement[] = [];
+        try {
+            const instructionPromises = instructions.map((ixn: any): Promise<DBElement> => {
+                return Promise.resolve({
+                    ixnData: ixn, // raw instruction object
+                    feePayer: feePayer,
+                    name: typeof ixn.programIdIndex === "number" && accountKeys[ixn.programIdIndex] ? accountKeys[ixn.programIdIndex] : null,
+                    accounts: Array.isArray(ixn.accounts) ? ixn.accounts.map((idx: number) => accountKeys[idx]) : []
+                });
+            });
+            
+            ixnArray = await Promise.all(instructionPromises);
+        } catch (err) {
+            console.error("Error while mapping instructions:", err);
+            throw err;
+        }
 
-    const ixnArray: DBElement[] = instructions.map((ixn: any): DBElement => {
-        const programIdIndex = ixn.programIdIndex;
-        const programIdStr = typeof programIdIndex === "number" && accountKeys[programIdIndex] ? accountKeys[programIdIndex] : null;
-        const accounts = Array.isArray(ixn.accounts) ? ixn.accounts.map((idx: number) => accountKeys[idx]) : [];
-        return {
-            ixnData: ixn, // raw instruction object
-            feePayer: feePayer,
-            name: programIdStr,
-            accounts: accounts
-        };
-    });
-
-    return ixnArray;
+        return ixnArray;
+    } catch (err) {
+        console.error("Error in parseInstructionsForGivenTransaction:", err);
+        throw err;
+    }
 }
 
 async function ParseAccountsAndUpsertToDB(rpcUrl: string, programId:string){
@@ -116,43 +134,64 @@ async function ParseAccountsAndUpsertToDB(rpcUrl: string, programId:string){
 // take that (ixn data,name,fee_payer,accounts) and push them to db
 // create different columns for each ixn data(JSONB) feePayer(text), name(text), accounts(text[]), use the same table txn-{programId} and add each new one row wise 
 async function upsertTransactionWithToDBWithInstructions(txnSig: string, programId: string, rpcUrl: string, pgUrl: string) {
-    const rows = await parseInstructionsForGivenTransaction(rpcUrl, txnSig);
-    const tableName = `txn_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+    let client: Client | null = null;
+    try {
+        // Parse instructions for the given transaction
+        const rows = await parseInstructionsForGivenTransaction(rpcUrl, txnSig);
+        
+        if (!rows || rows.length === 0) {
+            console.log(`No instructions found for transaction ${txnSig}`);
+            return;
+        }
 
-    const client = new Client({ connectionString: pgUrl });
-    await client.connect();
+        const tableName = `txn_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 
-    // Create table if not exists
-    const createTableQuery = `
-        CREATE TABLE IF NOT EXISTS "${tableName}" (
-            id SERIAL PRIMARY KEY,
-            txn_sig TEXT NOT NULL,
-            ixn_data JSONB NOT NULL,
-            fee_payer TEXT,
-            name TEXT,
-            accounts TEXT[]
-        );
-    `;
-    await client.query(createTableQuery);
+        // Connect to Postgres
+        client = new Client({ connectionString: pgUrl });
+        await client.connect();
 
-    // Insert each row
-    for (const row of rows) {
-        const insertQuery = `
-            INSERT INTO "${tableName}" (txn_sig, ixn_data, fee_payer, name, accounts)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT DO NOTHING;
+        // Create table if not exists
+        const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS "${tableName}" (
+                id SERIAL PRIMARY KEY,
+                txn_sig TEXT NOT NULL,
+                ixn_data JSONB NOT NULL,
+                fee_payer TEXT,
+                name TEXT,
+                accounts TEXT[]
+            );
         `;
-        await client.query(insertQuery, [
-            txnSig,
-            JSON.stringify(row.ixnData),
-            row.feePayer,
-            row.name,
-            row.accounts
-        ]);
-    }
+        await client.query(createTableQuery);
 
-    await client.end();
-    console.log("Succesfully inserted instructions into the table!")
+        // Insert each row
+        for (const row of rows) {
+            const insertQuery = `
+                INSERT INTO "${tableName}" (txn_sig, ixn_data, fee_payer, name, accounts)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT DO NOTHING;
+            `;
+            await client.query(insertQuery, [
+                txnSig,
+                JSON.stringify(row.ixnData),
+                row.feePayer,
+                row.name,
+                row.accounts
+            ]);
+        }
+
+        console.log(`Successfully inserted ${rows.length} instructions into table ${tableName}`);
+    } catch (error) {
+        console.error('Error in upsertTransactionWithToDBWithInstructions:', error);
+        throw error;
+    } finally {
+        if (client) {
+            try {
+                await client.end();
+            } catch (err) {
+                console.error('Error closing database connection:', err);
+            }
+        }
+    }
 }
 
 async function main() {
@@ -162,8 +201,8 @@ async function main() {
             RPC_URL: process.env.RPC_URL
         };
 
-        const txnSig = '2nBhEBYYvfaAe16UMNqRHre4YNSskvuYgx3M6E4JP1oDYvZEJHvoPzyUidNgNX5r9sTyN1J9UxtbCXy2rqYcuyuv';
-        const programId = ''
+        const txnSig = '4K4bfGp2wLS2fFejpFSFfH5u1anj2sUx6cu8Vu8RtRgPiU8xAwBG74EfHhNX8v3Bf4SBqaLyySKwGFVw1XujKZ1M';
+        const programId = 'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh'
 
         const missingEnvVars = Object.entries(requiredEnvVars)
             .filter(([_, value]) => !value)
