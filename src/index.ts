@@ -122,13 +122,92 @@ async function parseInstructionsForGivenTransaction(rpcUrl: string, txnSig: stri
     }
 }
 
-async function ParseAccountsAndUpsertToDB(rpcUrl: string, programId:string){
-    // get associated accounts owned by the programId
-    // parse each account
-    // return the account[] array
-    // make a new table program_{programId}
-    // each row would contain new account data
+type ProgramAccount = {
+    pubkey: string;
+    account: {
+        lamports: number;
+        owner: string;
+        data: any;
+        executable: boolean;
+        rentEpoch: number;
+        space: number;
+    };
+};
 
+type ParsedAccount = {
+    accountAddress: string;
+    owner: string;
+    data: any;
+    solBalance: number;
+};
+
+type RPCResponse = {
+    jsonrpc: string;
+    id: number;
+    result: ProgramAccount[];
+};
+
+async function getProgramAccounts(rpcUrl: string, programId: string): Promise<ProgramAccount[]> {
+    try {
+        if (!rpcUrl || typeof rpcUrl !== "string") {
+            throw new Error("Invalid rpcUrl provided");
+        }
+        if (!programId || typeof programId !== "string") {
+            throw new Error("Invalid programId provided");
+        }
+
+        const body = {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "getProgramAccounts",
+            params: [
+                programId,
+                {
+                    encoding: "jsonParsed",
+                    limit: 5
+                }
+            ]
+        };
+
+        const response = await fetch(rpcUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body)
+        });
+
+        if (!response.ok) {
+            throw new Error(`Network response was not ok: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json() as RPCResponse;
+        if (!data || typeof data !== "object" || ("error" in data && data.error) || !("result" in data)) {
+            throw new Error("Invalid RPC response: " + JSON.stringify(data));
+        }
+
+        return data.result;
+    } catch (err) {
+        console.error(`getProgramAccounts error for programId ${programId}:`, err);
+        throw err;
+    }
+}
+
+async function ParseAccountsAndUpsertToDB(rpcUrl: string, programId: string): Promise<ParsedAccount[]> {
+    try {
+        const LAMPORTS_PER_SOL = 1000000000;
+        const accounts = await getProgramAccounts(rpcUrl, programId);
+        
+        const parsedAccounts = accounts.map((account: ProgramAccount) => ({
+            accountAddress: account.pubkey,
+            owner: account.account.owner,
+            data: account.account.data,
+            solBalance: account.account.lamports / LAMPORTS_PER_SOL
+        }));
+
+        return parsedAccounts;
+    } catch (error) {
+        console.error('Error in ParseAccountsAndUpsertToDB:', error);
+        throw error;
+    }
 }
 
 // take that (ixn data,name,fee_payer,accounts) and push them to db
@@ -146,7 +225,7 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
 
         const tableName = `txn_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 
-        // Connect to Postgres
+
         client = new Client({ connectionString: pgUrl });
         await client.connect();
 
