@@ -273,6 +273,10 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
     }
 }
 
+async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: string){
+
+}
+
 async function main() {
     try {
         const requiredEnvVars = {
