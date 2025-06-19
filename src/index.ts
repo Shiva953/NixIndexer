@@ -2,6 +2,7 @@ import postgres from 'postgres';
 import pg, { Client } from "pg";
 import dotenv from 'dotenv';
 import path from 'path';
+import { Connection, PublicKey } from "@solana/web3.js";
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
@@ -273,8 +274,64 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
     }
 }
 
-async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: string){
+async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: string) {
+    const connection = new Connection(rpcUrl, "confirmed");
+    const pgUrl = process.env.POSTGRES_URL;
+    if (!pgUrl) throw new Error("POSTGRES_URL not set");
 
+    const tableName = `accounts_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+    let client: Client | null = null;
+
+    try {
+        client = new Client({ connectionString: pgUrl });
+        await client.connect();
+
+        const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS "${tableName}" (
+                id SERIAL PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                owner TEXT NOT NULL,
+                lamports BIGINT NOT NULL,
+                executable BOOLEAN NOT NULL,
+                rent_epoch BIGINT NOT NULL,
+                data BYTEA NOT NULL
+            );
+        `;
+        await client.query(createTableQuery);
+
+        const programKey = new PublicKey(programId);
+        const accounts = await connection.getProgramAccounts(programKey);
+
+        for (const acct of accounts) {
+            const { pubkey, account } = acct;
+            const insertQuery = `
+                INSERT INTO "${tableName}" (pubkey, owner, lamports, executable, rent_epoch, data)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (pubkey) DO NOTHING;
+            `;
+            await client.query(insertQuery, [
+                pubkey.toBase58(),
+                account.owner.toBase58(),
+                account.lamports,
+                account.executable,
+                account.rentEpoch,
+                Buffer.from(account.data)
+            ]);
+        }
+
+        console.log(`Successfully inserted ${accounts.length} accounts into table ${tableName}`);
+    } catch (error) {
+        console.error('Error in upsertProgramAssociatedAccountsToDB:', error);
+        throw error;
+    } finally {
+        if (client) {
+            try {
+                await client.end();
+            } catch (err) {
+                console.error('Error closing database connection:', err);
+            }
+        }
+    }
 }
 
 async function main() {
