@@ -274,12 +274,10 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
     }
 }
 
-async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: string) {
+async function upsertProgramAssociatedAccountsToDB(programId: string, rpcUrl: string, pgUrl: string) {
     const connection = new Connection(rpcUrl, "confirmed");
-    const pgUrl = process.env.POSTGRES_URL;
-    if (!pgUrl) throw new Error("POSTGRES_URL not set");
 
-    const tableName = `accounts_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+    const tableName = `accounts_new_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
     let client: Client | null = null;
 
     try {
@@ -293,7 +291,7 @@ async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: st
                 owner TEXT NOT NULL,
                 lamports BIGINT NOT NULL,
                 executable BOOLEAN NOT NULL,
-                rent_epoch BIGINT NOT NULL,
+                rent_epoch NUMERIC NOT NULL,
                 data BYTEA NOT NULL
             );
         `;
@@ -304,6 +302,8 @@ async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: st
 
         for (const acct of accounts) {
             const { pubkey, account } = acct;
+            const LAMPORTS_PER_SOL = 1000000000;
+            const rentEpochInSol = (typeof account.rentEpoch === 'number' ? account.rentEpoch : 0) / LAMPORTS_PER_SOL;
             const insertQuery = `
                 INSERT INTO "${tableName}" (pubkey, owner, lamports, executable, rent_epoch, data)
                 VALUES ($1, $2, $3, $4, $5, $6)
@@ -314,7 +314,7 @@ async function upsertProgramAssociatedAccountsToDB(rpcUrl: string, programId: st
                 account.owner.toBase58(),
                 account.lamports,
                 account.executable,
-                account.rentEpoch,
+                rentEpochInSol,
                 Buffer.from(account.data)
             ]);
         }
@@ -357,6 +357,7 @@ async function main() {
         console.log('Environment variables validated successfully');
 
         await upsertTransactionWithToDBWithInstructions(txnSig, programId, RPC_URL, POSTGRES_URL);
+        await upsertProgramAssociatedAccountsToDB(programId, RPC_URL, POSTGRES_URL)
         console.log("Successfully indexed instructions from a solana txn")
 
         
