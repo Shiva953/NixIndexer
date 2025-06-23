@@ -6,14 +6,30 @@ import { Connection, PublicKey } from "@solana/web3.js";
 
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
-console.log('Environment variables loaded:', {
-    POSTGRES_URL: process.env.POSTGRES_URL ? 'Set' : 'Not set',
-    RPC_URL: process.env.RPC_URL ? 'Set' : 'Not set'
-});
+type ProgramAccount = {
+    pubkey: string;
+    account: {
+        lamports: number;
+        owner: string;
+        data: any;
+        executable: boolean;
+        rentEpoch: number;
+        space: number;
+    };
+};
 
-// GET PROGRAM ID -> GET ALL TXNS FOR THAT PROGRAM ID(USE RPC METHODS TO QUERY) + PARSE EACH TXN 
-// FOR GIVEN (PROGRAM ID, TXN) -> FILTER ALL IXNS IN THAT TXN, (TAKE THE IXN DATA+NAME+FEE_PAYER+..) FOR EACH IXN FROM ITS MESSAGE HEADER
-// IXN <-> (DATA, NAME, FEE_PAYER, ...) -> PUSH TO POSTGRES DB IN txs_program_{programId} TABLE
+type ParsedAccount = {
+    accountAddress: string;
+    owner: string;
+    data: any;
+    solBalance: number;
+};
+
+type RPCResponse = {
+    jsonrpc: string;
+    id: number;
+    result: ProgramAccount[];
+};
 
 type DBElement = {
     ixnData: object;
@@ -22,14 +38,12 @@ type DBElement = {
     accounts: string[];
 };
 
-function getDb(dbUrl: string) {
-	return postgres(dbUrl);
-}
 
-// //get + parse txns for a given program id
-async function getTxnsForProgramId(programId: string) {
-    
-}
+// GET PROGRAM ID -> GET ALL TXNS FOR THAT PROGRAM ID(USE RPC METHODS TO QUERY) + PARSE EACH TXN 
+// FOR GIVEN (PROGRAM ID, TXN) -> FILTER ALL IXNS IN THAT TXN, (TAKE THE IXN DATA+NAME+FEE_PAYER+..) FOR EACH IXN FROM ITS MESSAGE HEADER
+// IXN <-> (DATA, NAME, FEE_PAYER, ...) -> PUSH TO POSTGRES DB IN txs_program_{programId} TABLE
+
+
 
 async function rpcFetch(rpcUrl: string, txnSig: string) {
     try {
@@ -123,30 +137,6 @@ async function parseInstructionsForGivenTransaction(rpcUrl: string, txnSig: stri
     }
 }
 
-type ProgramAccount = {
-    pubkey: string;
-    account: {
-        lamports: number;
-        owner: string;
-        data: any;
-        executable: boolean;
-        rentEpoch: number;
-        space: number;
-    };
-};
-
-type ParsedAccount = {
-    accountAddress: string;
-    owner: string;
-    data: any;
-    solBalance: number;
-};
-
-type RPCResponse = {
-    jsonrpc: string;
-    id: number;
-    result: ProgramAccount[];
-};
 
 async function getProgramAccounts(rpcUrl: string, programId: string): Promise<ProgramAccount[]> {
     try {
@@ -164,8 +154,8 @@ async function getProgramAccounts(rpcUrl: string, programId: string): Promise<Pr
             params: [
                 programId,
                 {
-                    encoding: "jsonParsed",
-                    limit: 5
+                    encoding: "base64",
+                    limit: 10
                 }
             ]
         };
@@ -185,7 +175,15 @@ async function getProgramAccounts(rpcUrl: string, programId: string): Promise<Pr
             throw new Error("Invalid RPC response: " + JSON.stringify(data));
         }
 
-        return data.result;
+        const programAccounts = data.result
+        if(programAccounts.length > 10){
+            return programAccounts.slice(0,10)
+        }
+        else{
+            return programAccounts
+        }
+
+        // return data.result;
     } catch (err) {
         console.error(`getProgramAccounts error for programId ${programId}:`, err);
         throw err;
@@ -216,7 +214,6 @@ async function ParseAccountsAndUpsertToDB(rpcUrl: string, programId: string): Pr
 async function upsertTransactionWithToDBWithInstructions(txnSig: string, programId: string, rpcUrl: string, pgUrl: string) {
     let client: Client | null = null;
     try {
-        // Parse instructions for the given transaction
         const rows = await parseInstructionsForGivenTransaction(rpcUrl, txnSig);
         
         if (!rows || rows.length === 0) {
@@ -226,11 +223,9 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
 
         const tableName = `txn_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
 
-
         client = new Client({ connectionString: pgUrl });
         await client.connect();
 
-        // Create table if not exists
         const createTableQuery = `
             CREATE TABLE IF NOT EXISTS "${tableName}" (
                 id SERIAL PRIMARY KEY,
@@ -243,7 +238,6 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
         `;
         await client.query(createTableQuery);
 
-        // Insert each row
         for (const row of rows) {
             const insertQuery = `
                 INSERT INTO "${tableName}" (txn_sig, ixn_data, fee_payer, name, accounts)
@@ -277,7 +271,7 @@ async function upsertTransactionWithToDBWithInstructions(txnSig: string, program
 async function upsertProgramAssociatedAccountsToDB(programId: string, rpcUrl: string, pgUrl: string) {
     const connection = new Connection(rpcUrl, "confirmed");
 
-    const tableName = `accounts_new_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
+    const tableName = `accounts_new_maxlimited_${programId.replace(/[^a-zA-Z0-9_]/g, "_")}`;
     let client: Client | null = null;
 
     try {
@@ -287,39 +281,50 @@ async function upsertProgramAssociatedAccountsToDB(programId: string, rpcUrl: st
         const createTableQuery = `
             CREATE TABLE IF NOT EXISTS "${tableName}" (
                 id SERIAL PRIMARY KEY,
-                pubkey TEXT NOT NULL,
+                pubkey TEXT NOT NULL UNIQUE,
                 owner TEXT NOT NULL,
                 lamports BIGINT NOT NULL,
                 executable BOOLEAN NOT NULL,
                 rent_epoch NUMERIC NOT NULL,
-                data BYTEA NOT NULL
+                data BYTEA NOT NULL,
+                space BIGINT
             );
         `;
         await client.query(createTableQuery);
 
         const programKey = new PublicKey(programId);
-        const accounts = await connection.getProgramAccounts(programKey);
+        const accounts = await getProgramAccounts(rpcUrl, programId);
 
         for (const acct of accounts) {
             const { pubkey, account } = acct;
             const LAMPORTS_PER_SOL = 1000000000;
             const rentEpochInSol = (typeof account.rentEpoch === 'number' ? account.rentEpoch : 0) / LAMPORTS_PER_SOL;
+            const dataBuffer = Array.isArray(account.data) && account.data.length > 0 && account.data[1] === 'base64'
+                ? Buffer.from(account.data[0], 'base64')
+                : Buffer.from([]);
             const insertQuery = `
-                INSERT INTO "${tableName}" (pubkey, owner, lamports, executable, rent_epoch, data)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (pubkey) DO NOTHING;
+                INSERT INTO "${tableName}" (pubkey, owner, lamports, executable, rent_epoch, data, space)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (pubkey) DO UPDATE SET
+                    owner = EXCLUDED.owner,
+                    lamports = EXCLUDED.lamports,
+                    executable = EXCLUDED.executable,
+                    rent_epoch = EXCLUDED.rent_epoch,
+                    data = EXCLUDED.data,
+                    space = EXCLUDED.space;
             `;
             await client.query(insertQuery, [
-                pubkey.toBase58(),
-                account.owner.toBase58(),
+                pubkey,
+                account.owner,
                 account.lamports,
                 account.executable,
                 rentEpochInSol,
-                Buffer.from(account.data)
+                dataBuffer,
+                account.space
             ]);
         }
 
-        console.log(`Successfully inserted ${accounts.length} accounts into table ${tableName}`);
+        console.log(`Successfully upserted ${accounts.length} accounts into table ${tableName}`);
     } catch (error) {
         console.error('Error in upsertProgramAssociatedAccountsToDB:', error);
         throw error;
@@ -333,7 +338,6 @@ async function upsertProgramAssociatedAccountsToDB(programId: string, rpcUrl: st
         }
     }
 }
-
 async function main() {
     try {
         const requiredEnvVars = {
@@ -366,5 +370,5 @@ async function main() {
         process.exit(1);
     }
 }
-
 main(); 
+
