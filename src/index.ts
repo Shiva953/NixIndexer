@@ -38,12 +38,9 @@ type DBElement = {
     accounts: string[];
 };
 
-
 // GET PROGRAM ID -> GET ALL TXNS FOR THAT PROGRAM ID(USE RPC METHODS TO QUERY) + PARSE EACH TXN 
 // FOR GIVEN (PROGRAM ID, TXN) -> FILTER ALL IXNS IN THAT TXN, (TAKE THE IXN DATA+NAME+FEE_PAYER+..) FOR EACH IXN FROM ITS MESSAGE HEADER
 // IXN <-> (DATA, NAME, FEE_PAYER, ...) -> PUSH TO POSTGRES DB IN txs_program_{programId} TABLE
-
-
 
 async function rpcFetch(rpcUrl: string, txnSig: string) {
     try {
@@ -292,7 +289,6 @@ async function upsertProgramAssociatedAccountsToDB(programId: string, rpcUrl: st
         `;
         await client.query(createTableQuery);
 
-        const programKey = new PublicKey(programId);
         const accounts = await getProgramAccounts(rpcUrl, programId);
 
         for (const acct of accounts) {
@@ -345,8 +341,13 @@ async function main() {
             RPC_URL: process.env.RPC_URL
         };
 
-        const txnSig = '4K4bfGp2wLS2fFejpFSFfH5u1anj2sUx6cu8Vu8RtRgPiU8xAwBG74EfHhNX8v3Bf4SBqaLyySKwGFVw1XujKZ1M';
-        const programId = 'DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh'
+        // Accept arguments from command line
+        const args = process.argv.slice(2);
+        if (args.length < 2) {
+            console.error('Usage: ts-node src/index.ts <PROGRAM_ID> <TXN_SIG>');
+            process.exit(1);
+        }
+        const [programId, txnSig] = args;
 
         const missingEnvVars = Object.entries(requiredEnvVars)
             .filter(([_, value]) => !value)
@@ -359,6 +360,8 @@ async function main() {
         const { POSTGRES_URL, RPC_URL } = requiredEnvVars as { POSTGRES_URL: string; RPC_URL: string };
 
         console.log('Environment variables validated successfully');
+        console.log(`Using Program ID: ${programId}`);
+        console.log(`Using Transaction Signature: ${txnSig}`);
 
         await upsertTransactionWithToDBWithInstructions(txnSig, programId, RPC_URL, POSTGRES_URL);
         await upsertProgramAssociatedAccountsToDB(programId, RPC_URL, POSTGRES_URL)
